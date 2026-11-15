@@ -1,0 +1,91 @@
+diff --git a/kernel-open/conftest.sh b/kernel-open/conftest.sh
+index 3996afc0..37b98883 100755
+--- a/kernel-open/conftest.sh
++++ b/kernel-open/conftest.sh
+@@ -4554,7 +4554,11 @@ compile_test() {
+             # in v6.11.
+             #
+             CODE="
++            #if defined(__has_include) && __has_include(<drm/clients/drm_fbdev_helper.h>)
++            #include <drm/clients/drm_fbdev_helper.h>
++            #else
+             #include <drm/drm_fb_helper.h>
++            #endif
+             #if defined(NV_DRM_DRM_FBDEV_GENERIC_H_PRESENT)
+             #include <drm/drm_fbdev_generic.h>
+             #endif
+@@ -4574,7 +4578,11 @@ compile_test() {
+             # 1000634477d8 ("drm/fbdev-ttm:Convert to client-setup") in v6.13.
+             #
+             CODE="
++            #if defined(__has_include) && __has_include(<drm/clients/drm_fbdev_helper.h>)
++            #include <drm/clients/drm_fbdev_helper.h>
++            #else
+             #include <drm/drm_fb_helper.h>
++            #endif
+             #if defined(NV_DRM_DRM_FBDEV_TTM_H_PRESENT)
+             #include <drm/drm_fbdev_ttm.h>
+             #endif
+@@ -4596,7 +4604,11 @@ compile_test() {
+             # in linux-next b86711c6d6e2.
+             #
+             CODE="
++            #if defined(__has_include) && __has_include(<drm/clients/drm_fbdev_helper.h>)
++            #include <drm/clients/drm_fbdev_helper.h>
++            #else
+             #include <drm/drm_fb_helper.h>
++            #endif
+             #if defined(NV_DRM_DRM_CLIENT_SETUP_H_PRESENT)
+             #include <drm/drm_client_setup.h>
+             #elif defined(NV_DRM_CLIENTS_DRM_CLIENT_SETUP_H_PRESENT)
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index de784e28..b1ed4611 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -64,8 +64,12 @@
+ #endif
+ 
+ #if defined(NV_DRM_FBDEV_AVAILABLE)
++#if defined(__has_include) && __has_include(<drm/clients/drm_fbdev_helper.h>)
++#include <drm/clients/drm_fbdev_helper.h>
++#else
+ #include <drm/drm_fb_helper.h>
+ #endif
++#endif
+ 
+ #if defined(NV_DRM_DRM_CLIENT_SETUP_H_PRESENT)
+ #include <drm/drm_client_setup.h>
+diff --git a/kernel-open/nvidia-uvm/uvm_hmm.c b/kernel-open/nvidia-uvm/uvm_hmm.c
+index 6f38ef46..40fd6059 100644
+--- a/kernel-open/nvidia-uvm/uvm_hmm.c
++++ b/kernel-open/nvidia-uvm/uvm_hmm.c
+@@ -4015,6 +4015,16 @@ static bool vma_has_cow_sharing(struct vm_area_struct *vma)
+ 
+ // TODO: Bug 3660968: Remove this hack as soon as HMM migration is implemented
+ // for VMAs other than anonymous private memory.
++#ifndef VM_SPECIAL
++#define VM_SPECIAL (VM_IO | VM_DONTEXPAND | VM_PFNMAP | VM_MIXEDMAP)
++#endif
++
++#if defined(__has_include) && !__has_include(<linux/hugetlb_inline.h>)
++#ifndef is_vm_hugetlb_page
++#define is_vm_hugetlb_page(vma) vma_is_hugetlb(vma)
++#endif
++#endif
++
+ bool uvm_hmm_must_use_sysmem(uvm_va_block_t *va_block,
+                              struct vm_area_struct *vma)
+ {
+diff --git a/kernel-open/nvidia/os-interface.c b/kernel-open/nvidia/os-interface.c
+index 107e6e59..3c46d8cb 100644
+--- a/kernel-open/nvidia/os-interface.c
++++ b/kernel-open/nvidia/os-interface.c
+@@ -2072,7 +2072,7 @@ NV_STATUS NV_API_CALL os_allocate_temporary_file
+ {
+     struct file *file = ERR_PTR(-EOPNOTSUPP);
+ #if NV_FILESYSTEM_ACCESS_AVAILABLE
+-    const char *default_path = "/tmp";
++    const char *default_path = "/var/tmp";
+     const int flags = O_TMPFILE | O_LARGEFILE | O_RDWR;
+     const char *path = NVreg_TemporaryFilePath;
+ 

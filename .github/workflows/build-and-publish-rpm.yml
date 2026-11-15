@@ -1,0 +1,245 @@
+name: Build and Publish mo-vidia RPMs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'patches/**'
+      - 'rpm/**'
+      - 'scripts/**'
+      - '.github/workflows/build-and-publish-rpm.yml'
+  schedule:
+    # Check upstream NVIDIA/open-gpu-kernel-modules daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream NVIDIA/open-gpu-kernel-modules tag or branch (leave empty for latest release tag / main)'
+        required: false
+        default: ''
+        type: string
+      force_build:
+        description: 'Force rebuild even if release already exists'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-upstream:
+    name: Resolve Upstream Version
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_ref: ${{ steps.meta.outputs.upstream_ref }}
+      upstream_sha: ${{ steps.meta.outputs.upstream_sha }}
+      driver_version: ${{ steps.meta.outputs.driver_version }}
+      patch_hash: ${{ steps.meta.outputs.patch_hash }}
+      should_build: ${{ steps.meta.outputs.should_build }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Checkout mo-vidia
+        uses: actions/checkout@v4
+
+      - name: Check upstream NVIDIA/open-gpu-kernel-modules
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_REF}" ]]; then
+            TARGET_REF="${INPUT_REF}"
+          else
+            # Pick the highest numeric release tag from upstream, or fallback to main
+            LATEST_TAG="$(git ls-remote --tags --refs https://github.com/NVIDIA/open-gpu-kernel-modules.git \
+              | awk -F'refs/tags/' '{print $2}' \
+              | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | sort -V \
+              | tail -n1 || true)"
+            TARGET_REF="${LATEST_TAG:-main}"
+          fi
+
+          WORKDIR="$(mktemp -d)"
+          git clone --depth 1 --branch "${TARGET_REF}" https://github.com/NVIDIA/open-gpu-kernel-modules.git "${WORKDIR}/upstream"
+          UPSTREAM_SHA="$(git -C "${WORKDIR}/upstream" rev-parse --short=10 HEAD)"
+          DRIVER_VERSION="$(awk '/^NVIDIA_VERSION =/ {print $3}' "${WORKDIR}/upstream/version.mk")"
+          PATCH_HASH="$(cat patches/*.patch rpm/*.spec | sha256sum | cut -c1-8)"
+
+          RELEASE_TAG="v${DRIVER_VERSION}-mo-vidia.${UPSTREAM_SHA}.${PATCH_HASH}"
+
+          SHOULD_BUILD="true"
+          if [[ "${EVENT_NAME}" == "schedule" && "${FORCE_BUILD}" != "true" ]]; then
+            if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "Release ${RELEASE_TAG} already exists; skipping scheduled rebuild."
+              SHOULD_BUILD="false"
+            fi
+          fi
+
+          echo "upstream_ref=${TARGET_REF}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "driver_version=${DRIVER_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "patch_hash=${PATCH_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "should_build=${SHOULD_BUILD}" >> "${GITHUB_OUTPUT}"
+
+  build-rpms:
+    name: Build RPMs (Fedora ${{ matrix.fedora }})
+    needs: resolve-upstream
+    if: needs.resolve-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:${{ matrix.fedora }}
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: ['latest', 'rawhide']
+    steps:
+      - name: Install Fedora build dependencies
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            rpm-build \
+            redhat-rpm-config \
+            kmodtool \
+            pahole \
+            kernel-devel \
+            gcc \
+            gcc-c++ \
+            make \
+            git \
+            rsync \
+            xz \
+            tar \
+            gawk \
+            findutils \
+            elfutils-libelf-devel \
+            pciutils \
+            createrepo_c
+
+      - name: Checkout mo-vidia
+        uses: actions/checkout@v4
+
+      - name: Build xorg-x11-drv-nvidia-kmodsrc, akmod-nvidia, and binary kmod-nvidia RPMs
+        env:
+          MO_VIDIA_REL: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          KVER="$(ls -1 /usr/src/kernels | sort -V | tail -n1 || true)"
+          EXTRA_ARGS=()
+          if [[ -n "${KVER}" && -d "/usr/src/kernels/${KVER}" ]]; then
+            EXTRA_ARGS+=(--with-binary-kmod --kernel-uname "${KVER}")
+          fi
+          ./scripts/build-rpms.sh \
+            --upstream-ref "${{ needs.resolve-upstream.outputs.upstream_ref }}" \
+            --release-num "${MO_VIDIA_REL}" \
+            --out-dir "dist/rpms/fc-${{ matrix.fedora }}" \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Upload built RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-fc-${{ matrix.fedora }}
+          path: dist/rpms/fc-${{ matrix.fedora }}/*.rpm
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release & DNF Repository
+    needs: [resolve-upstream, build-rpms]
+    if: needs.resolve-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mo-vidia
+        uses: actions/checkout@v4
+
+      - name: Download all RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Install createrepo_c
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y createrepo-c
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-upstream.outputs.release_tag }}
+          DRIVER_VERSION: ${{ needs.resolve-upstream.outputs.driver_version }}
+          UPSTREAM_REF: ${{ needs.resolve-upstream.outputs.upstream_ref }}
+          UPSTREAM_SHA: ${{ needs.resolve-upstream.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets
+          find artifacts/ -type f -name "*.rpm" -exec cp -vf {} release_assets/ \;
+
+          cat > release_notes.md <<EOF
+          ## mo-vidia Optimized NVIDIA Open GPU Kernel Modules (${DRIVER_VERSION})
+
+          - **Upstream Source**: \`NVIDIA/open-gpu-kernel-modules\` @ \`${UPSTREAM_REF}\` (\`${UPSTREAM_SHA}\`)
+          - **Packages Included**:
+            - \`xorg-x11-drv-nvidia-kmodsrc-3:${DRIVER_VERSION}-100.mo_vidia.${GITHUB_RUN_NUMBER}.*\`: Pre-compiled RM core (\`nv-kernel.o_binary\`, \`nv-modeset-kernel.o_binary\`) + patched \`kernel-open\` source tree
+            - \`akmod-nvidia-3:${DRIVER_VERSION}-100.mo_vidia.${GITHUB_RUN_NUMBER}.*\`: Automatic kernel module builder for any Fedora kernel (including RC/custom kernels)
+            - \`kmod-nvidia-3:${DRIVER_VERSION}-100.mo_vidia.${GITHUB_RUN_NUMBER}.*\`: Metapackage
+
+          ### Key Kernel Optimizations Included
+          1. **Non-Contiguous-First PMA VRAM Allocation & 2 MB -> 64 KB Fragmentation Fallback** (\`video_mem.c\`)
+          2. **Graceful Hardware Compression (\`comptag\`) Exhaustion Fallback** (\`mem_mgr_gm107.c\`)
+          3. **Skip Copy Engine Scrub-on-Free for Non-Compressible Surfaces** (\`mem_mgr.c\`)
+          4. **64 KB Large & 2 MB Huge System Memory Pages & Multi-Order Pools on Discrete GPUs** (\`g_mem_mgr_nvoc.c\`, \`mem_mgr.c\`, \`system_mem.c\`)
+          5. **Cache-Type-Aware (\`WB\` vs \`UC\`/\`WC\`) Page Pools Eliminating Cross-Core CPU IPI \`cpa_flush\` Shootdowns** (\`nv-vm.c\`)
+          6. **Default Resizable BAR / Static BAR1, PCIe Relaxed Ordering, and StreamMemOPs** (\`nv-reg.h\`)
+          EOF
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release_assets/*.rpm --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${RELEASE_TAG}" release_assets/*.rpm \
+              --title "mo-vidia ${DRIVER_VERSION} (${RELEASE_TAG})" \
+              --notes-file release_notes.md \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
+
+      - name: Update DNF Repository on gh-pages
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          OWNER_LOWER="$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          PAGES_URL="https://${OWNER_LOWER}.github.io/${REPO_NAME}"
+
+          WORK_GHP="$(mktemp -d)"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${WORK_GHP}"
+          else
+            git init "${WORK_GHP}"
+            git -C "${WORK_GHP}" checkout --orphan gh-pages
+          fi
+
+          mkdir -p "${WORK_GHP}/packages"
+          find artifacts/ -type f -name "*.rpm" -exec cp -vf {} "${WORK_GHP}/packages/" \;
+          createrepo_c --update "${WORK_GHP}"
+
+          cat > "${WORK_GHP}/mo-vidia.repo" <<EOF
+          [mo-vidia]
+          name=mo-vidia Optimized NVIDIA Open GPU Kernel Modules
+          baseurl=${PAGES_URL}
+          enabled=1
+          gpgcheck=0
+          metadata_expire=6h
+          EOF
+
+          git -C "${WORK_GHP}" config user.name "github-actions[bot]"
+          git -C "${WORK_GHP}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${WORK_GHP}" add -A
+          if ! git -C "${WORK_GHP}" diff --cached --quiet; then
+            git -C "${WORK_GHP}" commit -m "Update DNF repository for ${GITHUB_SHA::7}"
+            git -C "${WORK_GHP}" push origin HEAD:gh-pages
+          fi
