@@ -208,19 +208,22 @@ jobs:
 
       - name: Update DNF Repository on gh-pages
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           OWNER_LOWER="$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
           PAGES_URL="https://${OWNER_LOWER}.github.io/${REPO_NAME}"
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           WORK_GHP="$(mktemp -d)"
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git clone --depth 1 --branch gh-pages "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${WORK_GHP}"
+          if git ls-remote --exit-code --heads "${REMOTE_URL}" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "${REMOTE_URL}" "${WORK_GHP}"
           else
             git init "${WORK_GHP}"
             git -C "${WORK_GHP}" checkout --orphan gh-pages
+            git -C "${WORK_GHP}" remote add origin "${REMOTE_URL}"
           fi
 
           mkdir -p "${WORK_GHP}/packages"
