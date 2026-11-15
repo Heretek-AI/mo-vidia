@@ -1,0 +1,6 @@
+[mo-vidia]
+name=mo-vidia Optimized NVIDIA Open GPU Kernel Modules
+baseurl=https://heretek-ai.github.io/mo-vidia
+enabled=1
+gpgcheck=0
+metadata_expire=6h
